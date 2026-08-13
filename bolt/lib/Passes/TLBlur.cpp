@@ -178,6 +178,47 @@ static BinaryBasicBlock::iterator getFirstTerminator(BinaryBasicBlock &BB) {
   return Itr;
 }
 
+static bool shouldSaveEflags(BinaryContext &BC, BinaryBasicBlock &BB,
+                             BinaryBasicBlock::iterator It) {
+  if (opts::TLBlurSaveEflags)
+    return true;
+
+  BinaryFunction *BF = BB.getParent();
+  if (!BF || !BC.MIB || !BF->hasCFG() || !BF->hasCanonicalCFG() ||
+      BF->hasUnknownControlFlow() || !BB.isValid())
+    return true;
+
+  std::vector<BinaryBasicBlock *> Worklist{&BB};
+  SmallPtrSet<BinaryBasicBlock *, 16> Visited;
+  while (!Worklist.empty()) {
+    BinaryBasicBlock *Current = Worklist.back();
+    Worklist.pop_back();
+    if (!Current || Current->getParent() != BF || !Current->isValid() ||
+        !Current->hasCFG())
+      return true;
+    if (!Visited.insert(Current).second)
+      continue;
+
+    const auto Begin = Current == &BB ? It : Current->begin();
+    for (auto I = Begin; I != Current->end(); ++I) {
+      // Partial EFLAGS writers such as DEC and INC preserve CF.
+      if (BC.MIB->hasUseOfPhysReg(*I, BC.MIB->getFlagsReg()))
+        return true;
+    }
+
+    for (BinaryBasicBlock *Succ : Current->successors()) {
+      if (Succ == &BB)
+        return true;
+      if (!Succ || Succ->getParent() != BF || !Succ->isValid() ||
+          !Succ->hasCFG())
+        return true;
+      Worklist.push_back(Succ);
+    }
+  }
+
+  return false;
+}
+
 /// Instruments jumps that cross a page boundary. Can be called multiple times
 /// to add additional instrumentation after the binary layout has changed.
 bool TLBlurPass::instrumentJumps(BinaryContext &BC) {
@@ -218,13 +259,13 @@ bool TLBlurPass::instrumentJumps(BinaryContext &BC) {
                 ChangedBlock = true;
                 BC.MIB->addAnnotation(*It, "instrumented", true);
                 It = insertInstrumentation(BC, BB, Target, It,
-                                           opts::TLBlurSaveEflags);
+                                           shouldSaveEflags(BC, BB, It));
 
                 if (!BC.MIB->isTailCall(*It)) {
                   BC.MIB->addAnnotation(*It, "instrumented-ret", true);
                   ++It;
                   It = insertInstrumentation(BC, BB, BB.getLabel(), It,
-                                             opts::TLBlurSaveEflags);
+                                             shouldSaveEflags(BC, BB, It));
                 }
                 // Invalidate the size cache of the basic block.
                 // If the size of a block changes, the entire code layout
@@ -241,7 +282,7 @@ bool TLBlurPass::instrumentJumps(BinaryContext &BC) {
                 ChangedBlock = true;
                 InstrumentedBlocks.insert(&Succ);
                 insertInstrumentation(BC, Succ, Target, Succ.begin(),
-                                      opts::TLBlurSaveEflags);
+                                      shouldSaveEflags(BC, Succ, Succ.begin()));
                 // Invalidate the size cache of the basic block.
                 // If the size of a block changes, the entire code layout
                 // changes.
@@ -278,7 +319,7 @@ bool TLBlurPass::instrumentJumps(BinaryContext &BC) {
             // for each successor of the basic block
             InstrumentedJumps[&BB].insert(Succ);
             It = insertInstrumentation(BC, BB, Succ->getLabel(), It,
-                                       opts::TLBlurSaveEflags);
+                                       shouldSaveEflags(BC, BB, It));
             // Invalidate the size cache of the basic block.
             // If the size of a block changes, the entire code layout changes.
             invalidateSizeCache(&BB);
@@ -287,7 +328,7 @@ bool TLBlurPass::instrumentJumps(BinaryContext &BC) {
             // target block once, regardless of the predecessor.
             InstrumentedBlocks.insert(Succ);
             insertInstrumentation(BC, *Succ, Succ->getLabel(), Succ->begin(),
-                                  opts::TLBlurSaveEflags);
+                                  shouldSaveEflags(BC, *Succ, Succ->begin()));
             // Invalidate the size cache of the basic block.
             // If the size of a block changes, the entire code layout changes.
             invalidateSizeCache(Succ);
