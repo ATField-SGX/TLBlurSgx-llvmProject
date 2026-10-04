@@ -2438,6 +2438,11 @@ public:
   createTLBlurInstrumentationCall(const MCSymbol *Target, const MCSymbol *Instrumentation,
                                   MCContext *Ctx, bool StoreEflags = false) const override {
     InstructionListType Code;
+    // Leaf code spills into the 128-byte red zone. This call writes 32 bytes
+    // below RSP, so step over the red zone first. LEA keeps flags intact.
+    MCInst AllocRedZone;
+    createStackPointerIncrement(AllocRedZone, 128, /*NoFlagsClobber=*/true);
+    Code.emplace_back(AllocRedZone);
     MCInst PushRDI;
     createPushRegister(PushRDI, X86::RDI, 8);
     Code.emplace_back(PushRDI);
@@ -2480,6 +2485,9 @@ public:
     MCInst PopRDI;
     createPopRegister(PopRDI, X86::RDI, 8);
     Code.emplace_back(PopRDI);
+    MCInst FreeRedZone;
+    createStackPointerDecrement(FreeRedZone, 128, /*NoFlagsClobber=*/true);
+    Code.emplace_back(FreeRedZone);
 
     return Code;
   }

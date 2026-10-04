@@ -14,7 +14,12 @@
 #include "llvm/Support/Format.h"
 
 #define DEBUG_TYPE "bolt-tlblur"
-#define INSTRUMENTATION_LENGTH 19
+/*
+ * Encoded size of createTLBlurInstrumentationCall:
+ * lea -128(%rsp) 5, push rdi/rax 2, pushfq 1, lea target 7, call 5,
+ * popfq 1, pop rax/rdi 2, lea 128(%rsp) 8. The nop form is the same length.
+ */
+#define INSTRUMENTATION_LENGTH 31
 
 namespace opts {
 cl::opt<uint64_t> TLBlurPageMask(
