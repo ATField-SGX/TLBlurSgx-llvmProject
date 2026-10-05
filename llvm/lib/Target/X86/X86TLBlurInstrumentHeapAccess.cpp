@@ -318,39 +318,68 @@ MachineBasicBlock::iterator TLBlurInstrumentHeap::insertTLBUpdate(
     ImageBaseAM.Base.Reg = X86::RIP;
     addFullAddress(LEA, ImageBaseAM);
 
-    auto PageRegTemp =
+    auto OffsetReg =
         MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
-    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::SUB64rr), PageRegTemp)
+    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::SUB64rr), OffsetReg)
         .addReg(AddrReg)
         .addReg(ImageBaseReg);
+
+    // g_enclave_size is bytes. A host pointer minus the enclave base does
+    // not fall inside it. Skip the PAM update instead of masking the page.
+    auto SizeReg =
+        MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
+    X86AddressMode SizeAM;
+    SizeAM.GV = M->getGlobalVariable("g_enclave_size");
+    SizeAM.Base.Reg = X86::RIP;
+    addFullAddress(BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::MOV64rm),
+                           SizeReg),
+                   SizeAM);
+    MachineInstr *CmpI =
+        BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::CMP64rr))
+            .addReg(OffsetReg)
+            .addReg(SizeReg)
+            .getInstr();
+    MachineBasicBlock *Cont = MBB.splitAt(*CmpI);
+    MachineBasicBlock *UpdateMBB =
+        MF.CreateMachineBasicBlock(MBB.getBasicBlock());
+    MF.insert(Cont->getIterator(), UpdateMBB);
+    MBB.addSuccessor(UpdateMBB);
+    UpdateMBB->addSuccessor(Cont);
+    BuildMI(&MBB, DebugLoc(), TII->get(X86::JCC_1))
+        .addMBB(Cont)
+        .addImm(X86::COND_AE);
+    auto UpdateIP = UpdateMBB->end();
+
     auto PageRegTemp2 =
         MRI->createVirtualRegister(TRI->getRegClass(X86::GR64_NOSPRegClassID));
-    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::SAR64ri), PageRegTemp2)
-        .addReg(PageRegTemp)
+    BuildMI(*UpdateMBB, UpdateIP, DebugLoc(), TII->get(X86::SAR64ri),
+            PageRegTemp2)
+        .addReg(OffsetReg)
         .addImm(12);
     auto PageRegTemp3 =
         MRI->createVirtualRegister(TRI->getRegClass(X86::GR64_NOSPRegClassID));
-    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::AND64ri32),
+    BuildMI(*UpdateMBB, UpdateIP, DebugLoc(), TII->get(X86::AND64ri32),
             PageRegTemp3)
         .addReg(PageRegTemp2)
         .addImm(TLBLUR_VTLB_SIZE - 1);
     auto PageReg =
         MRI->createVirtualRegister(TRI->getRegClass(X86::GR64_NOSPRegClassID));
-    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::SHL64ri), PageReg)
+    BuildMI(*UpdateMBB, UpdateIP, DebugLoc(), TII->get(X86::SHL64ri), PageReg)
         .addReg(PageRegTemp3)
         .addImm(3);
 
     Register Counter = 0;
     if (!TLBlurCounterRegister) {
-      auto CounterReg = loadGlobalCounter(MBB, InsertPoint, DebugLoc());
+      auto CounterReg = loadGlobalCounter(*UpdateMBB, UpdateIP, DebugLoc());
       auto CounterIncReg =
           MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
-      BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::INC64r),
+      BuildMI(*UpdateMBB, UpdateIP, DebugLoc(), TII->get(X86::INC64r),
               CounterIncReg)
           .addReg(CounterReg);
       Counter = CounterIncReg;
     } else {
-      BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::INC64r), COUNTER_REG)
+      BuildMI(*UpdateMBB, UpdateIP, DebugLoc(), TII->get(X86::INC64r),
+              COUNTER_REG)
           .addReg(COUNTER_REG);
       Counter = COUNTER_REG;
     }
@@ -360,27 +389,32 @@ MachineBasicBlock::iterator TLBlurInstrumentHeap::insertTLBUpdate(
     VTLBAM.Base.Reg = X86::RIP;
     auto VTLBReg =
         MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
-    addFullAddress(
-        BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::LEA64r), VTLBReg),
-        VTLBAM);
+    addFullAddress(BuildMI(*UpdateMBB, UpdateIP, DebugLoc(),
+                           TII->get(X86::LEA64r), VTLBReg),
+                   VTLBAM);
 
     auto TargetAddrReg =
         MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
-    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::ADD64rr), TargetAddrReg)
+    BuildMI(*UpdateMBB, UpdateIP, DebugLoc(), TII->get(X86::ADD64rr),
+            TargetAddrReg)
         .addReg(VTLBReg)
         .addReg(PageReg);
 
     X86AddressMode TargetAM;
     TargetAM.Base.Reg = TargetAddrReg;
-    auto Store = BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::MOV64mr));
+    auto Store =
+        BuildMI(*UpdateMBB, UpdateIP, DebugLoc(), TII->get(X86::MOV64mr));
     addFullAddress(Store, TargetAM).addReg(Counter);
 
     if (!TLBlurCounterRegister)
-      storeGlobalCounter(MBB, InsertPoint, DebugLoc(), Counter);
+      storeGlobalCounter(*UpdateMBB, UpdateIP, DebugLoc(), Counter);
 
-    // Restore eflags if necessary
+    // Both paths join here. The compare clobbers flags.
     if (FlagsReg)
-      restoreEFLAGS(MBB, InsertPoint, DebugLoc(), FlagsReg);
+      restoreEFLAGS(*Cont, Cont->begin(), DebugLoc(), FlagsReg);
+    recomputeLiveIns(*Cont);
+    recomputeLiveIns(*UpdateMBB);
+    recomputeLiveIns(MBB);
   } else {
     // Insert a function call to update the software TLB
 
@@ -472,38 +506,37 @@ bool TLBlurInstrumentHeap::runOnMachineFunction(MachineFunction &MF) {
                        PointerType::getUnqual(M->getContext()));
   M->getOrInsertGlobal("__tlblur_pam",
                        PointerType::getUnqual(M->getContext()));
+  M->getOrInsertGlobal("g_enclave_size", Type::getInt64Ty(M->getContext()));
 
-  SmallVector<std::tuple<MachineInstr *, X86AddressMode>> ToInstrument;
-
+  // Split blocks while instrumenting. Collect first so the scan stays valid.
+  SmallVector<MachineInstr *, 32> Sites;
   for (MachineBasicBlock &MBB : MF) {
-    for (MachineInstr &MI : MBB) {
-      // Get the address mode of the instruction
-      std::optional<X86AddressMode> AM = getAddressMode(MI);
+    for (MachineInstr &MI : MBB)
+      if (getAddressMode(MI))
+        Sites.push_back(&MI);
+  }
 
-      // If the instruction has an address mode, insert instrumentation
-      if (AM.has_value()) {
-        MachineBasicBlock::iterator InsertPoint = MI.getIterator();
+  for (MachineInstr *MI : Sites) {
+    std::optional<X86AddressMode> AM = getAddressMode(*MI);
+    if (!AM)
+      continue;
+    MachineBasicBlock &MBB = *MI->getParent();
+    MachineBasicBlock::iterator InsertPoint = MI->getIterator();
 
-        // Try to insert code that writes the address mode to a register
-        //
-        // Note: indirect calls load from the address to get the function address
-        Register AddrReg = writeAddrModeToReg(
-            *AM, InsertPoint, MI.isCall() ? X86::MOV64rm : X86::LEA64r);
+    // Note: indirect calls load from the address to get the function address
+    Register AddrReg = writeAddrModeToReg(
+        *AM, InsertPoint, MI->isCall() ? X86::MOV64rm : X86::LEA64r);
 
-        if (AddrReg.isValid()) {
-          // Figure out which physical registers are currently live
-          LivePhysRegs LiveIns(*TRI);
-          LiveIns.addLiveOuts(MBB);
-          for (MachineInstr &MI :
-               llvm::reverse(llvm::make_range(InsertPoint, MBB.end()))) {
-            LiveIns.stepBackward(MI);
-          }
-
-          // Insert code to update the software TLB
-          insertTLBUpdate(AddrReg, InsertPoint, MBB, LiveIns);
-          Counter++;
-        }
+    if (AddrReg.isValid()) {
+      LivePhysRegs LiveIns(*TRI);
+      LiveIns.addLiveOuts(MBB);
+      for (MachineInstr &Prev :
+           llvm::reverse(llvm::make_range(InsertPoint, MBB.end()))) {
+        LiveIns.stepBackward(Prev);
       }
+
+      insertTLBUpdate(AddrReg, InsertPoint, MBB, LiveIns);
+      Counter++;
     }
   }
 
